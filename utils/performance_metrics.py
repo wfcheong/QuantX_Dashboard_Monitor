@@ -443,15 +443,21 @@ def calculate_metrics(
     # ========================================================================
     # BUILD EQUITY SERIES
     # ========================================================================
+    # --- Build timestamp series ---
     realized_ts = pd.to_datetime(realized_df["timestamp"], errors="coerce")
-    equity_df = pd.DataFrame(
-        {"equity": realized.cumsum() + float(start_equity)},
-        index=realized_ts,
-    )
-    equity_df = equity_df.dropna().sort_index()
 
-    if equity_df.empty or len(equity_df) == 0:
-        # No valid timestamps -> return defaults
+    # --- Build equity SERIES positionally (not by index alignment) ---
+    equity_series = pd.Series(
+        realized.cumsum().to_numpy() + float(start_equity),
+        index=realized_ts,
+        name="equity",
+    )
+
+    # Clean & sort
+    equity_series = equity_series.dropna().sort_index()
+
+    # If no valid timestamps, fall back to single-point equity curve
+    if equity_series.empty:
         base = _calculate_base_metrics(df, realized, None, price_lookup, start_equity)
         base.update({
             "cagr": 0.0,
@@ -464,8 +470,6 @@ def calculate_metrics(
             "metrics_warning": "",
         })
         return base
-
-    equity_series = equity_df["equity"]
 
     # ========================================================================
     # ENHANCED SHARPE/SORTINO WITH AUTO FREQUENCY DETECTION
