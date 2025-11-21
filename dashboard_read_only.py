@@ -46,9 +46,9 @@ except Exception:
     _IB_AVAILABLE = False
 
 # import inspect
-import importlib
-import utils.performance_metrics
-importlib.reload(utils.performance_metrics)
+# import importlib
+# import utils.performance_metrics
+# importlib.reload(utils.performance_metrics)
 
 from dotenv import load_dotenv
 # from utils.performance_metrics import calculate_metrics
@@ -1139,4 +1139,5 @@ def cleanup():
             pass
 
 import atexit
+
 atexit.register(cleanup)
