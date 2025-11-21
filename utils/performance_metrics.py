@@ -1,14 +1,19 @@
-# utils/performance_metrics.py
 """
 Professional performance metrics calculator for trading strategies.
 
 Features:
 - Comprehensive risk-adjusted metrics (Sharpe, Sortino, CAGR)
-- ENHANCED: Intraday Sharpe/Sortino when daily data insufficient
+- ENHANCED: Intraday Sharpe/Sortino with conservative annualization
 - Robust drawdown calculation with timestamps
 - Multi-directional position tracking (LONG/SHORT)
 - Open P/L calculation with live price lookup
 - Handles edge cases and missing data gracefully
+
+Conservative mode (Option A):
+- No annualization if equity timespan < 2 days
+- Intraday annualization factor capped at sqrt(252)
+- CAGR only computed if timespan >= 30 days
+- Sortino clipped to 99.99 when downside deviation ~ 0
 """
 
 import numpy as np
@@ -25,7 +30,7 @@ TRADING_HOURS_PER_DAY = 6.5  # US market: 9:30 AM - 4:00 PM ET
 TRADING_MINUTES_PER_YEAR = TRADING_DAYS_PER_YEAR * TRADING_HOURS_PER_DAY * 60
 
 MIN_DAILY_RETURNS_FOR_SHARPE = 10  # Minimum daily returns needed
-MIN_RETURNS_FOR_SHARPE = 5  # Absolute minimum returns needed
+MIN_RETURNS_FOR_SHARPE = 5        # Absolute minimum returns needed
 
 
 # ============================================================================
@@ -116,6 +121,14 @@ def _as_int(x: Any) -> int:
         return int(x)
     except Exception:
         return 0
+
+
+def _timespan_days_from_index(idx: pd.DatetimeIndex) -> float:
+    """Return total timespan in days from a datetime index."""
+    if idx is None or len(idx) < 2:
+        return 0.0
+    delta = idx[-1] - idx[0]
+    return float(delta.total_seconds()) / 86400.0
 
 
 # ============================================================================
@@ -265,7 +278,7 @@ def compute_open_pl(
 
 
 # ============================================================================
-# ENHANCED SHARPE/SORTINO WITH INTRADAY SUPPORT
+# ENHANCED SHARPE/SORTINO WITH CONSERVATIVE ANNUALIZATION
 # ============================================================================
 def calculate_sharpe_sortino(
     equity_series: pd.Series,
@@ -273,6 +286,10 @@ def calculate_sharpe_sortino(
 ) -> tuple[float, float, str]:
     """
     Calculate Sharpe and Sortino ratios with automatic frequency detection.
+
+    Conservative behavior (Option A):
+      - If timespan < 2 days → no annualization (raw mean/std ratios)
+      - For intraday annualization, cap factor at sqrt(252)
     
     Args:
         equity_series: Time-indexed equity curve
@@ -283,72 +300,112 @@ def calculate_sharpe_sortino(
     """
     if equity_series is None or len(equity_series) < MIN_RETURNS_FOR_SHARPE:
         return 0.0, 0.0, "insufficient_data"
-    
+
+    equity_series = equity_series.dropna().sort_index()
+    if equity_series.empty:
+        return 0.0, 0.0, "insufficient_data"
+
+    timespan_days = _timespan_days_from_index(equity_series.index)
+
     # Try daily first
     daily_equity = equity_series.resample("1D").last().dropna()
     daily_returns = daily_equity.pct_change().dropna()
     
     if len(daily_returns) >= MIN_DAILY_RETURNS_FOR_SHARPE:
-        # Sufficient daily returns
         mean_return = daily_returns.mean()
         std_return = daily_returns.std()
-        
-        # Sharpe (daily)
-        if std_return > 1e-6:
-            sharpe = float(mean_return / std_return * np.sqrt(TRADING_DAYS_PER_YEAR))
+
+        # Raw Sharpe if very short timespan
+        if timespan_days < 2 or std_return <= 1e-6:
+            sharpe = float(mean_return / std_return) if std_return > 1e-6 else 0.0
+            # Sortino
+            downside_returns = daily_returns[daily_returns < 0]
+            if len(downside_returns) > 1:
+                downside_std = downside_returns.std()
+                if downside_std > 1e-6:
+                    sortino = float(mean_return / downside_std)
+                else:
+                    sortino = 99.99 if mean_return > 0 else 0.0
+            else:
+                sortino = 99.99 if mean_return > 0 else 0.0
         else:
-            sharpe = 0.0
-        
-        # Sortino (daily)
-        downside_returns = daily_returns[daily_returns < 0]
+            # Annualized daily Sharpe
+            sharpe = float(mean_return / std_return * np.sqrt(TRADING_DAYS_PER_YEAR))
+            downside_returns = daily_returns[daily_returns < 0]
+            if len(downside_returns) > 1:
+                downside_std = downside_returns.std()
+                if downside_std > 1e-6:
+                    sortino = float(
+                        mean_return / downside_std * np.sqrt(TRADING_DAYS_PER_YEAR)
+                    )
+                else:
+                    sortino = 99.99 if mean_return > 0 else 0.0
+            else:
+                sortino = 99.99 if mean_return > 0 else 0.0
+
+        return sharpe, sortino, "daily"
+
+    # ---------------------------------------------------------------------
+    # Fall back to intraday / per-trade returns
+    # ---------------------------------------------------------------------
+    trade_returns = equity_series.pct_change().dropna()
+    if len(trade_returns) < MIN_RETURNS_FOR_SHARPE:
+        return 0.0, 0.0, "insufficient_data"
+
+    mean_return = trade_returns.mean()
+    std_return = trade_returns.std()
+
+    if std_return <= 1e-6:
+        sharpe = 0.0
+        downside_returns = trade_returns[trade_returns < 0]
         if len(downside_returns) > 1:
             downside_std = downside_returns.std()
-            if downside_std > 1e-6:
-                sortino = float(mean_return / downside_std * np.sqrt(TRADING_DAYS_PER_YEAR))
-            else:
-                sortino = 999.99 if mean_return > 0 else 0.0
+            sortino = float(mean_return / downside_std) if downside_std > 1e-6 else (
+                99.99 if mean_return > 0 else 0.0
+            )
         else:
-            sortino = 999.99 if mean_return > 0 else 0.0
-        
-        return sharpe, sortino, "daily"
-    
-    else:
-        # Fall back to intraday (per-trade returns)
-        trade_returns = equity_series.pct_change().dropna()
-        
-        if len(trade_returns) < MIN_RETURNS_FOR_SHARPE:
-            return 0.0, 0.0, "insufficient_data"
-        
-        # Estimate trades per year (assume intraday trading)
-        if len(equity_series) > 1:
-            time_span = (equity_series.index[-1] - equity_series.index[0]).total_seconds() / 60  # minutes
-            trades_per_minute = len(trade_returns) / max(time_span, 1)
-            trades_per_year = trades_per_minute * TRADING_MINUTES_PER_YEAR
-            annualization_factor = np.sqrt(max(trades_per_year, 1))
-        else:
-            annualization_factor = np.sqrt(TRADING_DAYS_PER_YEAR)
-        
-        mean_return = trade_returns.mean()
-        std_return = trade_returns.std()
-        
-        # Sharpe (intraday, annualized)
-        if std_return > 1e-6:
-            sharpe = float(mean_return / std_return * annualization_factor)
-        else:
-            sharpe = 0.0
-        
-        # Sortino (intraday, annualized)
+            sortino = 99.99 if mean_return > 0 else 0.0
+        return sharpe, sortino, "intraday"
+
+    if timespan_days < 2:
+        # No annualization for ultra-short periods
+        sharpe = float(mean_return / std_return)
         downside_returns = trade_returns[trade_returns < 0]
         if len(downside_returns) > 1:
             downside_std = downside_returns.std()
             if downside_std > 1e-6:
-                sortino = float(mean_return / downside_std * annualization_factor)
+                sortino = float(mean_return / downside_std)
             else:
-                sortino = 999.99 if mean_return > 0 else 0.0
+                sortino = 99.99 if mean_return > 0 else 0.0
         else:
-            sortino = 999.99 if mean_return > 0 else 0.0
-        
+            sortino = 99.99 if mean_return > 0 else 0.0
         return sharpe, sortino, "intraday"
+
+    # Longer timespan: conservative intraday annualization
+    time_span_minutes = (
+        (equity_series.index[-1] - equity_series.index[0]).total_seconds() / 60.0
+    )
+    trades_per_minute = len(trade_returns) / max(time_span_minutes, 1.0)
+    trades_per_year = trades_per_minute * TRADING_MINUTES_PER_YEAR
+
+    # Cap annualization factor at sqrt(252) for conservatism
+    annualization_factor = float(
+        np.sqrt(min(trades_per_year, TRADING_DAYS_PER_YEAR))
+    )
+
+    sharpe = float(mean_return / std_return * annualization_factor)
+
+    downside_returns = trade_returns[trade_returns < 0]
+    if len(downside_returns) > 1:
+        downside_std = downside_returns.std()
+        if downside_std > 1e-6:
+            sortino = float(mean_return / downside_std * annualization_factor)
+        else:
+            sortino = 99.99 if mean_return > 0 else 0.0
+    else:
+        sortino = 99.99 if mean_return > 0 else 0.0
+
+    return sharpe, sortino, "intraday"
 
 
 # ============================================================================
@@ -364,10 +421,10 @@ def calculate_metrics(
     
     Metrics included:
     - Closed P/L, Win Rate, Profit Factor
-    - Sharpe Ratio (daily or intraday, annualized)
+    - Sharpe Ratio (daily or intraday, annualized conservatively)
     - Sortino Ratio (downside deviation only)
-    - CAGR (Compound Annual Growth Rate)
-    - Volatility (annualized)
+    - CAGR (Compound Annual Growth Rate, only if timespan >= 30 days)
+    - Volatility (annualized, conservative)
     - Max Drawdown (absolute and percentage)
     - Trade statistics
     - Open P/L (if price_lookup provided)
@@ -408,12 +465,10 @@ def calculate_metrics(
     df["pnl_clean"] = pd.to_numeric(df["pnl"], errors="coerce")
 
     # ========================================================================
-    # IDENTIFY REALIZED TRADES (prefer SELL + filled)
+    # IDENTIFY REALIZED TRADES (prefer filled trades with non-null PnL)
     # ========================================================================
     if {"action", "status"}.issubset(df.columns):
-        a = df["action"].astype(str).str.upper()
         s = df["status"].astype(str).str.lower()
-        # mask = a.eq("SELL") & s.eq("filled") & df["pnl_clean"].notna()
         mask = s.eq("filled") & df["pnl_clean"].notna()
         realized_df = df[mask].copy()
         
@@ -441,22 +496,17 @@ def calculate_metrics(
         return base
 
     # ========================================================================
-    # BUILD EQUITY SERIES
+    # BUILD EQUITY SERIES (fixed positional logic)
     # ========================================================================
-    # --- Build timestamp series ---
     realized_ts = pd.to_datetime(realized_df["timestamp"], errors="coerce")
 
-    # --- Build equity SERIES positionally (not by index alignment) ---
     equity_series = pd.Series(
         realized.cumsum().to_numpy() + float(start_equity),
         index=realized_ts,
         name="equity",
     )
-
-    # Clean & sort
     equity_series = equity_series.dropna().sort_index()
 
-    # If no valid timestamps, fall back to single-point equity curve
     if equity_series.empty:
         base = _calculate_base_metrics(df, realized, None, price_lookup, start_equity)
         base.update({
@@ -471,17 +521,19 @@ def calculate_metrics(
         })
         return base
 
+    timespan_days = _timespan_days_from_index(equity_series.index)
+
     # ========================================================================
     # ENHANCED SHARPE/SORTINO WITH AUTO FREQUENCY DETECTION
     # ========================================================================
     sharpe_daily, sortino, freq_used = calculate_sharpe_sortino(equity_series)
     
-    # Generate warning message if using intraday
+    # Generate warning message if using intraday or insufficient data
     if freq_used == "intraday":
         daily_count = len(equity_series.resample("1D").last().dropna())
         metrics_warning = (
             f"⚠️ Using intraday Sharpe/Sortino (only {daily_count} trading days). "
-            f"Collect {MIN_DAILY_RETURNS_FOR_SHARPE}+ days for accurate daily metrics."
+            f"Collect {MIN_DAILY_RETURNS_FOR_SHARPE}+ days for stable daily metrics."
         )
     elif freq_used == "insufficient_data":
         metrics_warning = "⚠️ Insufficient data for Sharpe/Sortino calculation."
@@ -489,32 +541,42 @@ def calculate_metrics(
         metrics_warning = ""
 
     # ========================================================================
-    # DAILY RETURNS FOR VOLATILITY
+    # DAILY RETURNS FOR VOLATILITY (CONSERVATIVE)
     # ========================================================================
     daily_equity = equity_series.resample("1D").last().dropna()
     daily_returns = daily_equity.pct_change().dropna()
     
-    if len(daily_returns) > 1:
+    if len(daily_returns) > 1 and timespan_days >= 2:
         volatility = float(daily_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR))
     else:
         # Fall back to trade-level volatility
         trade_returns = equity_series.pct_change().dropna()
         if len(trade_returns) > 1:
-            time_span_minutes = (equity_series.index[-1] - equity_series.index[0]).total_seconds() / 60
-            trades_per_minute = len(trade_returns) / max(time_span_minutes, 1)
-            trades_per_year = trades_per_minute * TRADING_MINUTES_PER_YEAR
-            volatility = float(trade_returns.std() * np.sqrt(max(trades_per_year, 1)))
+            if timespan_days >= 2:
+                time_span_minutes = (
+                    (equity_series.index[-1] - equity_series.index[0]).total_seconds()
+                    / 60.0
+                )
+                trades_per_minute = len(trade_returns) / max(time_span_minutes, 1.0)
+                trades_per_year = trades_per_minute * TRADING_MINUTES_PER_YEAR
+                annualization_factor = float(
+                    np.sqrt(min(trades_per_year, TRADING_DAYS_PER_YEAR))
+                )
+                volatility = float(trade_returns.std() * annualization_factor)
+            else:
+                # No annualization for ultra-short samples
+                volatility = float(trade_returns.std())
         else:
             volatility = 0.0
 
     # ========================================================================
-    # CAGR (Compound Annual Growth Rate)
+    # CAGR (Compound Annual Growth Rate) – ONLY if timespan >= 30 days
     # ========================================================================
-    if len(daily_equity) > 1:
+    if len(daily_equity) > 1 and timespan_days >= 30.0:
         start_val = float(daily_equity.iloc[0])
         end_val = float(daily_equity.iloc[-1])
         days = (daily_equity.index[-1] - daily_equity.index[0]).days
-        years = max(days / 365.25, 1/365.25)  # At least 1 day
+        years = max(days / 365.25, 1 / 365.25)  # At least 1 day
         
         if start_val > 0:
             cagr = float((end_val / start_val) ** (1.0 / years) - 1.0)
